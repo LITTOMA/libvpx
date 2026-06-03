@@ -22,6 +22,10 @@
 #include <string.h>
 #include <time.h>
 
+#ifdef __3DS__
+#include <3ds.h>
+#endif
+
 #define O3VPX_MAGIC "O3VX"
 #define O3VPX_VERSION 13
 #define WIDTH O3VPX_WIDTH
@@ -177,6 +181,32 @@ typedef struct O3vpxReader {
   size_t buffer_len;
 } O3vpxReader;
 
+typedef struct O3vpxMbCommand {
+  uint8_t mode;
+  uint8_t block_count;
+  MV mv;
+  int8_t dc_y;
+  int8_t dc_u;
+  int8_t dc_v;
+  int8_t dc_y4[4];
+  union {
+    uint8_t raw[RAW_MB_BYTES];
+    ResBlock blocks[RES_BLOCKS_PER_MB];
+    struct {
+      uint8_t raw[RAW_UV_MB_BYTES];
+      ResBlock blocks[16];
+    } rawuv;
+  } data;
+} O3vpxMbCommand;
+
+typedef struct O3vpxReconstructJob {
+  uint8_t *recon;
+  const uint8_t *ref;
+  const O3vpxMbCommand *commands;
+  int res_q;
+  int eye;
+} O3vpxReconstructJob;
+
 typedef struct O3vpxDecoderState {
   const uint8_t *stream;
   size_t stream_len;
@@ -187,6 +217,14 @@ typedef struct O3vpxDecoderState {
   int frame_no;
   uint8_t *ref;
   uint8_t *recon;
+  O3vpxMbCommand *commands;
+#ifdef __3DS__
+  Thread worker_thread;
+  volatile int worker_running;
+  volatile int worker_has_job;
+  volatile int worker_done;
+  O3vpxReconstructJob worker_job;
+#endif
 } O3vpxDecoderState;
 
 static uint64_t scaled_gain(uint64_t gain, double scale);
@@ -1117,9 +1155,8 @@ static void write_raw_mb(Buffer *payload, const uint8_t *src, int mb_index) {
   }
 }
 
-static void read_raw_mb(O3vpxReader *reader, uint8_t *dst, int mb_index) {
-  uint8_t tmp[RAW_MB_BYTES];
-  uint8_t *p = tmp;
+static void apply_raw_mb_bytes_to_frame(uint8_t *dst, int mb_index,
+                                        const uint8_t *p) {
   uint8_t *dst_y = dst;
   uint8_t *dst_u = dst + Y_SIZE;
   uint8_t *dst_v = dst + Y_SIZE + UV_SIZE;
@@ -1130,7 +1167,6 @@ static void read_raw_mb(O3vpxReader *reader, uint8_t *dst, int mb_index) {
   int y = mb_y * 16;
   int uvx = mb_x * 8;
   int uvy = mb_y * 8;
-  reader_exact(reader, tmp, sizeof(tmp));
   for (row = 0; row < 16; ++row) {
     memcpy(dst_y + (y + row) * WIDTH + x, p, 16);
     p += 16;
@@ -1168,15 +1204,13 @@ static void write_raw_y_mb(Buffer *payload, const uint8_t *src, int mb_index) {
   }
 }
 
-static void read_raw_y_mb(O3vpxReader *reader, uint8_t *dst, int mb_index) {
-  uint8_t tmp[RAW_Y_MB_BYTES];
+static void apply_raw_y_mb_bytes_to_frame(uint8_t *dst, int mb_index,
+                                          const uint8_t *p) {
   const int mb_x = mb_index % MB_W;
   const int mb_y = mb_index / MB_W;
   const int x = mb_x * 16;
   const int y = mb_y * 16;
-  const uint8_t *p = tmp;
   int row;
-  reader_exact(reader, tmp, sizeof(tmp));
   for (row = 0; row < 16; ++row) {
     memcpy(dst + (y + row) * WIDTH + x, p, 16);
     p += 16;
@@ -1219,9 +1253,8 @@ static void write_raw_uv_mb(Buffer *payload, const uint8_t *src,
   }
 }
 
-static void read_raw_uv_mb(O3vpxReader *reader, uint8_t *dst, int mb_index) {
-  uint8_t tmp[RAW_UV_MB_BYTES];
-  const uint8_t *p = tmp;
+static void apply_raw_uv_mb_bytes_to_frame(uint8_t *dst, int mb_index,
+                                           const uint8_t *p) {
   uint8_t *dst_u = dst + Y_SIZE;
   uint8_t *dst_v = dst + Y_SIZE + UV_SIZE;
   const int mb_x = mb_index % MB_W;
@@ -1229,7 +1262,6 @@ static void read_raw_uv_mb(O3vpxReader *reader, uint8_t *dst, int mb_index) {
   const int uvx = mb_x * 8;
   const int uvy = mb_y * 8;
   int row;
-  reader_exact(reader, tmp, sizeof(tmp));
   for (row = 0; row < 8; ++row) {
     memcpy(dst_u + (uvy + row) * UV_W + uvx, p, 8);
     p += 8;
@@ -1341,23 +1373,6 @@ static void write_raw4(Buffer *payload, const uint8_t *src, int mb_index,
   patch4_geometry(mb_index, plane, block, &base, &stride, &x, &y);
   for (row = 0; row < 4; ++row) {
     buffer_bytes(payload, src + base + (y + row) * stride + x, 4);
-  }
-}
-
-static void read_raw4(O3vpxReader *reader, uint8_t *dst, int mb_index,
-                      uint8_t plane, uint8_t block) {
-  uint8_t tmp[RAW_4X4_BYTES];
-  const uint8_t *p = tmp;
-  int base;
-  int stride;
-  int x;
-  int y;
-  int row;
-  patch4_geometry(mb_index, plane, block, &base, &stride, &x, &y);
-  reader_exact(reader, tmp, sizeof(tmp));
-  for (row = 0; row < 4; ++row) {
-    memcpy(dst + base + (y + row) * stride + x, p, 4);
-    p += 4;
   }
 }
 
@@ -2932,8 +2947,272 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
   return EXIT_SUCCESS;
 }
 
+static void parse_p_frame_commands(O3vpxReader *reader,
+                                   O3vpxMbCommand *commands,
+                                   uint32_t payload_len,
+                                   O3vpxFrameInfo *info) {
+  uint32_t consumed = 0;
+  int mb;
+  if (!commands) die("missing P-frame command buffer");
+  for (mb = 0; mb < MB_COUNT; ++mb) {
+    O3vpxMbCommand *cmd = &commands[mb];
+    uint8_t mode = get_u8(reader);
+    cmd->mode = mode;
+    cmd->block_count = 0;
+    consumed += 1;
+    if (info && mode < O3VPX_MODE_COUNT) {
+      info->mode_counts[mode]++;
+    }
+    if (mode == MODE_COPY16) {
+      cmd->mv.col = (int8_t)get_u8(reader);
+      cmd->mv.row = (int8_t)get_u8(reader);
+      consumed += 2;
+      if (!mv_in_bounds_same_eye(mb, cmd->mv)) die("copy MV out of bounds");
+      count_mv_mb(info, cmd->mv);
+    } else if (mode == MODE_COPY16_DC) {
+      cmd->mv.col = (int8_t)get_u8(reader);
+      cmd->mv.row = (int8_t)get_u8(reader);
+      cmd->dc_y = (int8_t)get_u8(reader);
+      cmd->dc_u = (int8_t)get_u8(reader);
+      cmd->dc_v = (int8_t)get_u8(reader);
+      consumed += 5;
+      if (!mv_in_bounds_same_eye(mb, cmd->mv)) die("copy-dc MV out of bounds");
+      count_mv_mb(info, cmd->mv);
+    } else if (mode == MODE_COPY16_QDC) {
+      int q;
+      cmd->mv.col = (int8_t)get_u8(reader);
+      cmd->mv.row = (int8_t)get_u8(reader);
+      for (q = 0; q < 4; ++q) cmd->dc_y4[q] = (int8_t)get_u8(reader);
+      cmd->dc_u = (int8_t)get_u8(reader);
+      cmd->dc_v = (int8_t)get_u8(reader);
+      consumed += 8;
+      if (!mv_in_bounds_same_eye(mb, cmd->mv)) die("copy-qdc MV out of bounds");
+      count_mv_mb(info, cmd->mv);
+    } else if (mode == MODE_RAW_MB) {
+      reader_exact(reader, cmd->data.raw, RAW_MB_BYTES);
+      consumed += RAW_MB_BYTES;
+    } else if (mode == MODE_RAW_Y_MB) {
+      cmd->mv.col = (int8_t)get_u8(reader);
+      cmd->mv.row = (int8_t)get_u8(reader);
+      consumed += 2;
+      if (!mv_in_bounds_same_eye(mb, cmd->mv)) die("raw-y MV out of bounds");
+      count_mv_mb(info, cmd->mv);
+      reader_exact(reader, cmd->data.raw, RAW_Y_MB_BYTES);
+      consumed += RAW_Y_MB_BYTES;
+    } else if (mode == MODE_RAW_UV_MB) {
+      cmd->mv.col = (int8_t)get_u8(reader);
+      cmd->mv.row = (int8_t)get_u8(reader);
+      consumed += 2;
+      if (!mv_in_bounds_same_eye(mb, cmd->mv)) die("raw-uv MV out of bounds");
+      count_mv_mb(info, cmd->mv);
+      reader_exact(reader, cmd->data.raw, RAW_UV_MB_BYTES);
+      consumed += RAW_UV_MB_BYTES;
+    } else if (mode == MODE_COPY16_RES4_RAWUV) {
+      uint8_t block_count;
+      uint8_t block_index;
+      cmd->mv.col = (int8_t)get_u8(reader);
+      cmd->mv.row = (int8_t)get_u8(reader);
+      block_count = get_u8(reader);
+      cmd->block_count = block_count;
+      consumed += 3;
+      if (!mv_in_bounds_same_eye(mb, cmd->mv)) {
+        die("rawuv-residual MV out of bounds");
+      }
+      if (block_count > 16) die("too many rawuv residual blocks");
+      count_mv_mb(info, cmd->mv);
+      reader_exact(reader, cmd->data.rawuv.raw, RAW_UV_MB_BYTES);
+      consumed += RAW_UV_MB_BYTES;
+      for (block_index = 0; block_index < block_count; ++block_index) {
+        ResBlock *block = &cmd->data.rawuv.blocks[block_index];
+        consumed += (uint32_t)read_res4(reader, block);
+        count_res4_block(info, block);
+        if (block->plane != PATCH_PLANE_Y) die("rawuv residual not luma");
+      }
+    } else if (mode == MODE_INTRA_DC || mode == MODE_INTRA_V ||
+               mode == MODE_INTRA_H) {
+    } else if (mode == MODE_COPY16_PATCH4) {
+      uint8_t patch_count;
+      uint8_t patch;
+      cmd->mv.col = (int8_t)get_u8(reader);
+      cmd->mv.row = (int8_t)get_u8(reader);
+      patch_count = get_u8(reader);
+      cmd->block_count = patch_count;
+      consumed += 3;
+      if (!mv_in_bounds_same_eye(mb, cmd->mv)) die("patch MV out of bounds");
+      if (patch_count > PATCH_CANDIDATES_PER_MB) {
+        die("too many 4x4 patches");
+      }
+      count_mv_mb(info, cmd->mv);
+      for (patch = 0; patch < patch_count; ++patch) {
+        ResBlock *block = &cmd->data.blocks[patch];
+        block->type = REPAIR_CAND_RAW4;
+        block->plane = get_u8(reader);
+        block->block = get_u8(reader);
+        if (!valid_4x4_block(block->plane, block->block)) {
+          die("bad 4x4 patch block");
+        }
+        reader_exact(reader, block->raw, RAW_4X4_BYTES);
+        if (info) info->raw4_blocks++;
+        consumed += 2 + RAW_4X4_BYTES;
+      }
+    } else if (mode == MODE_COPY16_RES4) {
+      uint8_t block_count;
+      uint8_t block_index;
+      cmd->mv.col = (int8_t)get_u8(reader);
+      cmd->mv.row = (int8_t)get_u8(reader);
+      block_count = get_u8(reader);
+      cmd->block_count = block_count;
+      consumed += 3;
+      if (!mv_in_bounds_same_eye(mb, cmd->mv)) die("residual MV out of bounds");
+      if (block_count > RES_BLOCKS_PER_MB) die("too many residual blocks");
+      count_mv_mb(info, cmd->mv);
+      for (block_index = 0; block_index < block_count; ++block_index) {
+        ResBlock *block = &cmd->data.blocks[block_index];
+        consumed += (uint32_t)read_res4(reader, block);
+        count_res4_block(info, block);
+      }
+    } else {
+      die("bad P-frame mode");
+    }
+  }
+  if (consumed != payload_len) die("bad P-frame payload length");
+}
+
+static void apply_mb_command(uint8_t *recon, const uint8_t *ref, int mb,
+                             const O3vpxMbCommand *cmd, int res_q) {
+  uint8_t block_index;
+  if (cmd->mode == MODE_COPY16) {
+    copy_mb_from_ref(recon, ref, mb, cmd->mv);
+  } else if (cmd->mode == MODE_COPY16_DC) {
+    apply_copy16_dc_to_frame(recon, ref, mb, cmd->mv, cmd->dc_y, cmd->dc_u,
+                             cmd->dc_v);
+  } else if (cmd->mode == MODE_COPY16_QDC) {
+    apply_copy16_qdc_to_frame(recon, ref, mb, cmd->mv, cmd->dc_y4, cmd->dc_u,
+                              cmd->dc_v);
+  } else if (cmd->mode == MODE_RAW_MB) {
+    apply_raw_mb_bytes_to_frame(recon, mb, cmd->data.raw);
+  } else if (cmd->mode == MODE_RAW_Y_MB) {
+    copy_mb_uv_from_ref(recon, ref, mb, cmd->mv);
+    apply_raw_y_mb_bytes_to_frame(recon, mb, cmd->data.raw);
+  } else if (cmd->mode == MODE_RAW_UV_MB) {
+    copy_mb_y_from_ref(recon, ref, mb, cmd->mv);
+    apply_raw_uv_mb_bytes_to_frame(recon, mb, cmd->data.raw);
+  } else if (cmd->mode == MODE_COPY16_RES4_RAWUV) {
+    copy_mb_y_from_ref(recon, ref, mb, cmd->mv);
+    apply_raw_uv_mb_bytes_to_frame(recon, mb, cmd->data.rawuv.raw);
+    for (block_index = 0; block_index < cmd->block_count; ++block_index) {
+      apply_res4_to_frame(recon, mb, &cmd->data.rawuv.blocks[block_index],
+                          res_q);
+    }
+  } else if (cmd->mode == MODE_INTRA_DC) {
+    predict_intra_mb(recon, mb, MODE_INTRA_DC);
+  } else if (cmd->mode == MODE_INTRA_V) {
+    predict_intra_mb(recon, mb, MODE_INTRA_V);
+  } else if (cmd->mode == MODE_INTRA_H) {
+    predict_intra_mb(recon, mb, MODE_INTRA_H);
+  } else if (cmd->mode == MODE_COPY16_PATCH4) {
+    copy_mb_from_ref(recon, ref, mb, cmd->mv);
+    for (block_index = 0; block_index < cmd->block_count; ++block_index) {
+      apply_res4_to_frame(recon, mb, &cmd->data.blocks[block_index], res_q);
+    }
+  } else if (cmd->mode == MODE_COPY16_RES4) {
+    copy_mb_from_ref(recon, ref, mb, cmd->mv);
+    for (block_index = 0; block_index < cmd->block_count; ++block_index) {
+      apply_res4_to_frame(recon, mb, &cmd->data.blocks[block_index], res_q);
+    }
+  } else {
+    die("bad P-frame mode");
+  }
+}
+
+static void reconstruct_p_frame_eye(uint8_t *recon, const uint8_t *ref,
+                                    const O3vpxMbCommand *commands, int res_q,
+                                    int eye) {
+  const int start_x = eye ? MB_W / 2 : 0;
+  const int end_x = eye ? MB_W : MB_W / 2;
+  int mb_y;
+  for (mb_y = 0; mb_y < MB_H; ++mb_y) {
+    int mb_x;
+    for (mb_x = start_x; mb_x < end_x; ++mb_x) {
+      const int mb = mb_y * MB_W + mb_x;
+      apply_mb_command(recon, ref, mb, &commands[mb], res_q);
+    }
+  }
+}
+
+#ifdef __3DS__
+static void o3vpx_reconstruct_worker_thread(void *arg) {
+  O3vpxDecoderState *state = (O3vpxDecoderState *)arg;
+  while (state->worker_running) {
+    if (!state->worker_has_job) {
+      svcSleepThread(10000);
+      continue;
+    }
+    reconstruct_p_frame_eye(state->worker_job.recon, state->worker_job.ref,
+                            state->worker_job.commands, state->worker_job.res_q,
+                            state->worker_job.eye);
+    state->worker_has_job = 0;
+    state->worker_done = 1;
+  }
+}
+
+static int o3vpx_start_reconstruct_worker(O3vpxDecoderState *state) {
+  s32 prio = 0x2a;
+  if (!state || state->worker_thread != NULL) return 0;
+  svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+  state->worker_running = 1;
+  state->worker_has_job = 0;
+  state->worker_done = 1;
+  state->worker_thread =
+      threadCreate(o3vpx_reconstruct_worker_thread, state, 64 * 1024, prio,
+                   -1, false);
+  if (state->worker_thread == NULL) {
+    state->worker_running = 0;
+    return -1;
+  }
+  return 0;
+}
+
+static void o3vpx_stop_reconstruct_worker(O3vpxDecoderState *state) {
+  if (!state || state->worker_thread == NULL) return;
+  state->worker_running = 0;
+  threadJoin(state->worker_thread, UINT64_MAX);
+  threadFree(state->worker_thread);
+  state->worker_thread = NULL;
+  state->worker_has_job = 0;
+  state->worker_done = 0;
+}
+#endif
+
+static void reconstruct_p_frame(O3vpxDecoderState *state, uint8_t *recon,
+                                const uint8_t *ref,
+                                const O3vpxMbCommand *commands, int res_q) {
+#ifdef __3DS__
+  if (state && state->worker_thread != NULL) {
+    state->worker_job.recon = recon;
+    state->worker_job.ref = ref;
+    state->worker_job.commands = commands;
+    state->worker_job.res_q = res_q;
+    state->worker_job.eye = 1;
+    state->worker_done = 0;
+    state->worker_has_job = 1;
+    reconstruct_p_frame_eye(recon, ref, commands, res_q, 0);
+    while (!state->worker_done) {
+      svcSleepThread(1000);
+    }
+    return;
+  }
+#else
+  (void)state;
+#endif
+  reconstruct_p_frame_eye(recon, ref, commands, res_q, 0);
+  reconstruct_p_frame_eye(recon, ref, commands, res_q, 1);
+}
+
 static int decode_next_frame_from_reader(O3vpxReader *reader, uint8_t *ref,
-                                         uint8_t *recon, int res_q,
+                                         uint8_t *recon,
+                                         O3vpxMbCommand *commands,
+                                         O3vpxDecoderState *state, int res_q,
                                          int frame_no, O3vpxFrameInfo *info,
                                          size_t *total_bytes) {
   uint16_t frame_type = get_le16(reader);
@@ -2944,147 +3223,8 @@ static int decode_next_frame_from_reader(O3vpxReader *reader, uint8_t *ref,
     if (payload_len != FRAME_SIZE) die("bad raw key payload size");
     reader_exact(reader, recon, FRAME_SIZE);
   } else if (frame_type == FRAME_P) {
-    uint32_t consumed = 0;
-    int mb;
-    for (mb = 0; mb < MB_COUNT; ++mb) {
-      uint8_t mode = get_u8(reader);
-      consumed += 1;
-      if (info && mode < O3VPX_MODE_COUNT) {
-        info->mode_counts[mode]++;
-      }
-      if (mode == MODE_COPY16) {
-        MV mv;
-        mv.col = (int8_t)get_u8(reader);
-        mv.row = (int8_t)get_u8(reader);
-        consumed += 2;
-        if (!mv_in_bounds_same_eye(mb, mv)) die("copy MV out of bounds");
-        count_mv_mb(info, mv);
-        copy_mb_from_ref(recon, ref, mb, mv);
-      } else if (mode == MODE_COPY16_DC) {
-        MV mv;
-        int8_t dc_y;
-        int8_t dc_u;
-        int8_t dc_v;
-        mv.col = (int8_t)get_u8(reader);
-        mv.row = (int8_t)get_u8(reader);
-        dc_y = (int8_t)get_u8(reader);
-        dc_u = (int8_t)get_u8(reader);
-        dc_v = (int8_t)get_u8(reader);
-        consumed += 5;
-        if (!mv_in_bounds_same_eye(mb, mv)) die("copy-dc MV out of bounds");
-        count_mv_mb(info, mv);
-        apply_copy16_dc_to_frame(recon, ref, mb, mv, dc_y, dc_u, dc_v);
-      } else if (mode == MODE_COPY16_QDC) {
-        MV mv;
-        int8_t dc_y4[4];
-        int8_t dc_u;
-        int8_t dc_v;
-        int q;
-        mv.col = (int8_t)get_u8(reader);
-        mv.row = (int8_t)get_u8(reader);
-        for (q = 0; q < 4; ++q) dc_y4[q] = (int8_t)get_u8(reader);
-        dc_u = (int8_t)get_u8(reader);
-        dc_v = (int8_t)get_u8(reader);
-        consumed += 8;
-        if (!mv_in_bounds_same_eye(mb, mv)) die("copy-qdc MV out of bounds");
-        count_mv_mb(info, mv);
-        apply_copy16_qdc_to_frame(recon, ref, mb, mv, dc_y4, dc_u, dc_v);
-      } else if (mode == MODE_RAW_MB) {
-        read_raw_mb(reader, recon, mb);
-        consumed += RAW_MB_BYTES;
-      } else if (mode == MODE_RAW_Y_MB) {
-        MV mv;
-        mv.col = (int8_t)get_u8(reader);
-        mv.row = (int8_t)get_u8(reader);
-        consumed += 2;
-        if (!mv_in_bounds_same_eye(mb, mv)) die("raw-y MV out of bounds");
-        count_mv_mb(info, mv);
-        copy_mb_uv_from_ref(recon, ref, mb, mv);
-        read_raw_y_mb(reader, recon, mb);
-        consumed += RAW_Y_MB_BYTES;
-      } else if (mode == MODE_RAW_UV_MB) {
-        MV mv;
-        mv.col = (int8_t)get_u8(reader);
-        mv.row = (int8_t)get_u8(reader);
-        consumed += 2;
-        if (!mv_in_bounds_same_eye(mb, mv)) die("raw-uv MV out of bounds");
-        count_mv_mb(info, mv);
-        copy_mb_y_from_ref(recon, ref, mb, mv);
-        read_raw_uv_mb(reader, recon, mb);
-        consumed += RAW_UV_MB_BYTES;
-      } else if (mode == MODE_COPY16_RES4_RAWUV) {
-        MV mv;
-        uint8_t block_count;
-        uint8_t block_index;
-        mv.col = (int8_t)get_u8(reader);
-        mv.row = (int8_t)get_u8(reader);
-        block_count = get_u8(reader);
-        consumed += 3;
-        if (!mv_in_bounds_same_eye(mb, mv)) {
-          die("rawuv-residual MV out of bounds");
-        }
-        if (block_count > 16) die("too many rawuv residual blocks");
-        count_mv_mb(info, mv);
-        copy_mb_y_from_ref(recon, ref, mb, mv);
-        read_raw_uv_mb(reader, recon, mb);
-        consumed += RAW_UV_MB_BYTES;
-        for (block_index = 0; block_index < block_count; ++block_index) {
-          ResBlock block;
-          consumed += (uint32_t)read_res4(reader, &block);
-          count_res4_block(info, &block);
-          if (block.plane != PATCH_PLANE_Y) die("rawuv residual not luma");
-          apply_res4_to_frame(recon, mb, &block, res_q);
-        }
-      } else if (mode == MODE_INTRA_DC) {
-        predict_intra_mb(recon, mb, MODE_INTRA_DC);
-      } else if (mode == MODE_INTRA_V) {
-        predict_intra_mb(recon, mb, MODE_INTRA_V);
-      } else if (mode == MODE_INTRA_H) {
-        predict_intra_mb(recon, mb, MODE_INTRA_H);
-      } else if (mode == MODE_COPY16_PATCH4) {
-        MV mv;
-        uint8_t patch_count;
-        uint8_t patch;
-        mv.col = (int8_t)get_u8(reader);
-        mv.row = (int8_t)get_u8(reader);
-        patch_count = get_u8(reader);
-        consumed += 3;
-        if (!mv_in_bounds_same_eye(mb, mv)) die("patch MV out of bounds");
-        if (patch_count > PATCH_CANDIDATES_PER_MB) {
-          die("too many 4x4 patches");
-        }
-        count_mv_mb(info, mv);
-        copy_mb_from_ref(recon, ref, mb, mv);
-        for (patch = 0; patch < patch_count; ++patch) {
-          uint8_t plane = get_u8(reader);
-          uint8_t block = get_u8(reader);
-          read_raw4(reader, recon, mb, plane, block);
-          if (info) info->raw4_blocks++;
-          consumed += 2 + RAW_4X4_BYTES;
-        }
-      } else if (mode == MODE_COPY16_RES4) {
-        MV mv;
-        uint8_t block_count;
-        uint8_t block_index;
-        mv.col = (int8_t)get_u8(reader);
-        mv.row = (int8_t)get_u8(reader);
-        block_count = get_u8(reader);
-        consumed += 3;
-        if (!mv_in_bounds_same_eye(mb, mv)) die("residual MV out of bounds");
-        if (block_count > RES_BLOCKS_PER_MB) die("too many residual blocks");
-        count_mv_mb(info, mv);
-        copy_mb_from_ref(recon, ref, mb, mv);
-        for (block_index = 0; block_index < block_count; ++block_index) {
-          ResBlock block;
-          consumed += (uint32_t)read_res4(reader, &block);
-          count_res4_block(info, &block);
-          apply_res4_to_frame(recon, mb, &block, res_q);
-        }
-      } else {
-        die("bad P-frame mode");
-      }
-    }
-    if (consumed != payload_len) die("bad P-frame payload length");
+    parse_p_frame_commands(reader, commands, payload_len, info);
+    reconstruct_p_frame(state, recon, ref, commands, res_q);
   } else {
     die("bad frame type");
   }
@@ -3100,7 +3240,9 @@ size_t vp8_o3vpx_decoder_size(void) { return sizeof(O3vpxDecoderState); }
 
 size_t vp8_o3vpx_decoder_align(void) { return 16; }
 
-size_t vp8_o3vpx_decoder_internal_bytes(void) { return FRAME_SIZE * 2; }
+size_t vp8_o3vpx_decoder_internal_bytes(void) {
+  return FRAME_SIZE * 2 + sizeof(O3vpxMbCommand) * MB_COUNT;
+}
 
 size_t vp8_o3vpx_frame_bytes(void) { return O3VPX_FRAME_SIZE; }
 
@@ -3108,20 +3250,30 @@ size_t vp8_o3vpx_eye_frame_bytes(void) { return O3VPX_EYE_FRAME_SIZE; }
 
 static void decoder_free_frame_buffers(O3vpxDecoderState *state) {
   if (!state) return;
+#ifdef __3DS__
+  o3vpx_stop_reconstruct_worker(state);
+#endif
   free(state->ref);
   free(state->recon);
+  free(state->commands);
   state->ref = NULL;
   state->recon = NULL;
+  state->commands = NULL;
 }
 
 static int decoder_alloc_frame_buffers(O3vpxDecoderState *state) {
   if (!state) return -1;
   state->ref = (uint8_t *)malloc(FRAME_SIZE);
   state->recon = (uint8_t *)malloc(FRAME_SIZE);
-  if (!state->ref || !state->recon) {
+  state->commands =
+      (O3vpxMbCommand *)malloc(sizeof(O3vpxMbCommand) * MB_COUNT);
+  if (!state->ref || !state->recon || !state->commands) {
     decoder_free_frame_buffers(state);
     return -2;
   }
+#ifdef __3DS__
+  (void)o3vpx_start_reconstruct_worker(state);
+#endif
   return 0;
 }
 
@@ -3136,7 +3288,7 @@ static int decoder_finish_init(O3vpxDecoderState *state) {
 
 int vp8_o3vpx_decoder_reset(void *decoder) {
   O3vpxDecoderState *state = (O3vpxDecoderState *)decoder;
-  if (!state || !state->ref || !state->recon ||
+  if (!state || !state->ref || !state->recon || !state->commands ||
       (!state->stream_file && (!state->stream || state->stream_len == 0))) {
     return -1;
   }
@@ -3190,11 +3342,11 @@ int vp8_o3vpx_decoder_next_frame(void *decoder, O3vpxFrameInfo *info) {
   O3vpxDecoderState *state = (O3vpxDecoderState *)decoder;
   int rc;
   uint8_t *tmp;
-  if (!state || !state->ref || !state->recon) return -1;
+  if (!state || !state->ref || !state->recon || !state->commands) return -1;
   if (state->frame_no >= state->frames) return 0;
   rc = decode_next_frame_from_reader(&state->reader, state->recon, state->ref,
-                                     state->res_q, state->frame_no, info,
-                                     NULL);
+                                     state->commands, state, state->res_q,
+                                     state->frame_no, info, NULL);
   if (rc > 0) {
     tmp = state->recon;
     state->recon = state->ref;
@@ -3286,6 +3438,8 @@ int vp8_o3vpx_decode_file_limit(const char *in_path, const char *out_path,
   int frame_no;
   uint8_t *ref = (uint8_t *)xmalloc(FRAME_SIZE);
   uint8_t *recon = (uint8_t *)xmalloc(FRAME_SIZE);
+  O3vpxMbCommand *commands =
+      (O3vpxMbCommand *)xmalloc(sizeof(O3vpxMbCommand) * MB_COUNT);
   size_t total_bytes = 0;
   double t0;
   double elapsed;
@@ -3302,8 +3456,8 @@ int vp8_o3vpx_decode_file_limit(const char *in_path, const char *out_path,
   t0 = now_seconds();
   for (frame_no = 0; frame_no < frames; ++frame_no) {
     uint8_t *tmp;
-    decode_next_frame_from_reader(
-        &reader, ref, recon, res_q, frame_no, NULL, &total_bytes);
+    decode_next_frame_from_reader(&reader, ref, recon, commands, NULL, res_q,
+                                  frame_no, NULL, &total_bytes);
     if (out && fwrite(recon, 1, FRAME_SIZE, out) != FRAME_SIZE) {
       die_errno("write failed");
     }
@@ -3318,6 +3472,7 @@ int vp8_o3vpx_decode_file_limit(const char *in_path, const char *out_path,
           frames, total_bytes, elapsed, (double)frames / elapsed);
   free(ref);
   free(recon);
+  free(commands);
   fclose(in);
   if (out) fclose(out);
   return EXIT_SUCCESS;
