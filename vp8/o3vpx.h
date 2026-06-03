@@ -41,6 +41,9 @@ int vp8_o3vpx_decoder_init_file(void *decoder, size_t decoder_size,
                                 FILE *stream);
 int vp8_o3vpx_decoder_reset(void *decoder);
 int vp8_o3vpx_decoder_next_frame(void *decoder, O3vpxFrameInfo *info);
+int vp8_o3vpx_decoder_write_current_eye_yuv420p(void *decoder, int eye,
+                                                unsigned char *out,
+                                                size_t out_len);
 int vp8_o3vpx_decoder_write_current_yuv420p(void *decoder,
                                             unsigned char *left,
                                             size_t left_len,

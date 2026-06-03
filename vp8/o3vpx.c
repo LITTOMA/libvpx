@@ -3155,51 +3155,58 @@ int vp8_o3vpx_decoder_next_frame(void *decoder, O3vpxFrameInfo *info) {
   return rc;
 }
 
-int vp8_o3vpx_decoder_write_current_yuv420p(void *decoder, unsigned char *left,
-                                            size_t left_len,
-                                            unsigned char *right,
-                                            size_t right_len) {
+int vp8_o3vpx_decoder_write_current_eye_yuv420p(void *decoder, int eye,
+                                                unsigned char *out,
+                                                size_t out_len) {
   O3vpxDecoderState *state = (O3vpxDecoderState *)decoder;
   const uint8_t *src_y;
   const uint8_t *src_u;
   const uint8_t *src_v;
-  uint8_t *left_y;
-  uint8_t *left_u;
-  uint8_t *left_v;
-  uint8_t *right_y;
-  uint8_t *right_u;
-  uint8_t *right_v;
+  uint8_t *out_y;
+  uint8_t *out_u;
+  uint8_t *out_v;
+  int y_x;
+  int uv_x;
   int row;
-  if (!state || !state->recon || !left || !right ||
-      left_len < O3VPX_EYE_FRAME_SIZE || right_len < O3VPX_EYE_FRAME_SIZE) {
+  if (!state || !state->recon || !out ||
+      out_len < O3VPX_EYE_FRAME_SIZE || (eye != 0 && eye != 1)) {
     return -1;
   }
   src_y = state->recon;
   src_u = state->recon + Y_SIZE;
   src_v = state->recon + Y_SIZE + UV_SIZE;
-  left_y = left;
-  left_u = left + O3VPX_EYE_WIDTH * O3VPX_EYE_HEIGHT;
-  left_v = left_u + (O3VPX_EYE_WIDTH / 2) * (O3VPX_EYE_HEIGHT / 2);
-  right_y = right;
-  right_u = right + O3VPX_EYE_WIDTH * O3VPX_EYE_HEIGHT;
-  right_v = right_u + (O3VPX_EYE_WIDTH / 2) * (O3VPX_EYE_HEIGHT / 2);
+  out_y = out;
+  out_u = out + O3VPX_EYE_WIDTH * O3VPX_EYE_HEIGHT;
+  out_v = out_u + (O3VPX_EYE_WIDTH / 2) * (O3VPX_EYE_HEIGHT / 2);
+  y_x = eye == 0 ? 0 : O3VPX_EYE_WIDTH;
+  uv_x = eye == 0 ? 0 : O3VPX_EYE_WIDTH / 2;
   for (row = 0; row < HEIGHT; ++row) {
-    memcpy(left_y + row * O3VPX_EYE_WIDTH, src_y + row * WIDTH,
+    memcpy(out_y + row * O3VPX_EYE_WIDTH, src_y + row * WIDTH + y_x,
            O3VPX_EYE_WIDTH);
-    memcpy(right_y + row * O3VPX_EYE_WIDTH,
-           src_y + row * WIDTH + O3VPX_EYE_WIDTH, O3VPX_EYE_WIDTH);
   }
   for (row = 0; row < UV_H; ++row) {
-    memcpy(left_u + row * (O3VPX_EYE_WIDTH / 2), src_u + row * UV_W,
+    memcpy(out_u + row * (O3VPX_EYE_WIDTH / 2), src_u + row * UV_W + uv_x,
            O3VPX_EYE_WIDTH / 2);
-    memcpy(right_u + row * (O3VPX_EYE_WIDTH / 2),
-           src_u + row * UV_W + O3VPX_EYE_WIDTH / 2, O3VPX_EYE_WIDTH / 2);
-    memcpy(left_v + row * (O3VPX_EYE_WIDTH / 2), src_v + row * UV_W,
+    memcpy(out_v + row * (O3VPX_EYE_WIDTH / 2), src_v + row * UV_W + uv_x,
            O3VPX_EYE_WIDTH / 2);
-    memcpy(right_v + row * (O3VPX_EYE_WIDTH / 2),
-           src_v + row * UV_W + O3VPX_EYE_WIDTH / 2, O3VPX_EYE_WIDTH / 2);
   }
   return 0;
+}
+
+int vp8_o3vpx_decoder_write_current_yuv420p(void *decoder, unsigned char *left,
+                                            size_t left_len,
+                                            unsigned char *right,
+                                            size_t right_len) {
+  int rc;
+  if (!right || right_len < O3VPX_EYE_FRAME_SIZE) {
+    return -1;
+  }
+  rc = vp8_o3vpx_decoder_write_current_eye_yuv420p(decoder, 0, left, left_len);
+  if (rc != 0) {
+    return rc;
+  }
+  return vp8_o3vpx_decoder_write_current_eye_yuv420p(decoder, 1, right,
+                                                     right_len);
 }
 
 void vp8_o3vpx_decoder_drop(void *decoder) {
