@@ -24,11 +24,18 @@ extern "C" {
 #define O3VPX_EYE_HEIGHT O3VPX_HEIGHT
 #define O3VPX_EYE_FRAME_SIZE \
   (O3VPX_EYE_WIDTH * O3VPX_EYE_HEIGHT * 3 / 2)
+#define O3VPX_MODE_COUNT 12
 
 typedef struct O3vpxFrameInfo {
   unsigned int frame_no;
   unsigned int frame_type;
   unsigned int frame_size_bytes;
+  unsigned int mode_counts[O3VPX_MODE_COUNT];
+  unsigned int residual_blocks;
+  unsigned int raw4_blocks;
+  unsigned int dc_only_blocks;
+  unsigned int full_idct_blocks;
+  unsigned int halfpel_mb;
 } O3vpxFrameInfo;
 
 size_t vp8_o3vpx_decoder_size(void);
