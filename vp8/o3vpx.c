@@ -184,6 +184,9 @@ typedef struct O3vpxReader {
 typedef struct O3vpxMbCommand {
   uint8_t mode;
   uint8_t block_count;
+  uint8_t raw_u_mask;
+  uint8_t raw_v_mask;
+  uint16_t raw_y_mask;
   MV mv;
   int8_t dc_y;
   int8_t dc_u;
@@ -685,6 +688,156 @@ static void copy_mb_from_ref(uint8_t *dst, const uint8_t *ref, int mb_index,
                              MV mv) {
   copy_mb_y_from_ref(dst, ref, mb_index, mv);
   copy_mb_uv_from_ref(dst, ref, mb_index, mv);
+}
+
+static void copy_mb_y_from_ref_masked(uint8_t *dst, const uint8_t *ref,
+                                      int mb_index, MV mv,
+                                      uint16_t raw_y_mask) {
+  const uint8_t *ref_y = ref;
+  uint8_t *dst_y = dst;
+  int mb_x;
+  int mb_y;
+  int row;
+  int x;
+  int y;
+  int rx2;
+  int ry2;
+  int rx;
+  int ry;
+  int fx;
+  int fy;
+  if (raw_y_mask == 0) {
+    copy_mb_y_from_ref(dst, ref, mb_index, mv);
+    return;
+  }
+  if (raw_y_mask == 0xffff) return;
+  mb_x = mb_index % MB_W;
+  mb_y = mb_index / MB_W;
+  x = mb_x * 16;
+  y = mb_y * 16;
+  rx2 = x * 2 + mv.col;
+  ry2 = y * 2 + mv.row;
+  rx = rx2 >> 1;
+  ry = ry2 >> 1;
+  fx = rx2 & 1;
+  fy = ry2 & 1;
+  for (row = 0; row < 16; ++row) {
+    const uint16_t row_mask =
+        (uint16_t)((raw_y_mask >> ((row >> 2) * 4)) & 0x0f);
+    uint8_t *d = dst_y + (y + row) * WIDTH + x;
+    int block_x;
+    if (row_mask == 0) {
+      if (!fx && !fy) {
+        memcpy(d, ref_y + (ry + row) * WIDTH + rx, 16);
+      } else {
+        const uint8_t *s0 = ref_y + (ry + row) * WIDTH + rx;
+        const uint8_t *s1 = s0 + WIDTH;
+        int col;
+        if (fx && !fy) {
+          for (col = 0; col < 16; ++col) {
+            d[col] = avg2_u8(s0[col], s0[col + 1]);
+          }
+        } else if (!fx && fy) {
+          for (col = 0; col < 16; ++col) {
+            d[col] = avg2_u8(s0[col], s1[col]);
+          }
+        } else {
+          for (col = 0; col < 16; ++col) {
+            d[col] = (uint8_t)(((int)s0[col] + (int)s0[col + 1] +
+                                (int)s1[col] + (int)s1[col + 1] + 2) >>
+                               2);
+          }
+        }
+      }
+      continue;
+    }
+    for (block_x = 0; block_x < 4; ++block_x) {
+      const int dst_col = block_x * 4;
+      int col;
+      if (row_mask & (uint16_t)(1u << block_x)) continue;
+      if (!fx && !fy) {
+        memcpy(d + dst_col, ref_y + (ry + row) * WIDTH + rx + dst_col, 4);
+      } else {
+        const uint8_t *s0 = ref_y + (ry + row) * WIDTH + rx + dst_col;
+        const uint8_t *s1 = s0 + WIDTH;
+        if (fx && !fy) {
+          for (col = 0; col < 4; ++col) {
+            d[dst_col + col] = avg2_u8(s0[col], s0[col + 1]);
+          }
+        } else if (!fx && fy) {
+          for (col = 0; col < 4; ++col) {
+            d[dst_col + col] = avg2_u8(s0[col], s1[col]);
+          }
+        } else {
+          for (col = 0; col < 4; ++col) {
+            d[dst_col + col] =
+                (uint8_t)(((int)s0[col] + (int)s0[col + 1] +
+                            (int)s1[col] + (int)s1[col + 1] + 2) >>
+                           2);
+          }
+        }
+      }
+    }
+  }
+}
+
+static void copy_8x8_plane_from_ref_masked(uint8_t *dst, const uint8_t *ref,
+                                           int dst_stride, int mb_x, int mb_y,
+                                           int ruvx, int ruvy,
+                                           uint8_t raw_mask) {
+  const int uvx = mb_x * 8;
+  const int uvy = mb_y * 8;
+  int row;
+  if (raw_mask == 0) {
+    for (row = 0; row < 8; ++row) {
+      memcpy(dst + (uvy + row) * dst_stride + uvx,
+             ref + (ruvy + row) * dst_stride + ruvx, 8);
+    }
+    return;
+  }
+  if ((raw_mask & 0x0f) == 0x0f) return;
+  for (row = 0; row < 8; ++row) {
+    const uint8_t row_mask = (uint8_t)((raw_mask >> ((row >> 2) * 2)) & 0x03);
+    uint8_t *d = dst + (uvy + row) * dst_stride + uvx;
+    const uint8_t *s = ref + (ruvy + row) * dst_stride + ruvx;
+    if (row_mask == 0) {
+      memcpy(d, s, 8);
+    } else {
+      if ((row_mask & 0x01) == 0) memcpy(d, s, 4);
+      if ((row_mask & 0x02) == 0) memcpy(d + 4, s + 4, 4);
+    }
+  }
+}
+
+static void copy_mb_uv_from_ref_masked(uint8_t *dst, const uint8_t *ref,
+                                       int mb_index, MV mv, uint8_t raw_u_mask,
+                                       uint8_t raw_v_mask) {
+  const int mb_x = mb_index % MB_W;
+  const int mb_y = mb_index / MB_W;
+  const int uvx = mb_x * 8;
+  const int uvy = mb_y * 8;
+  const int ruvx = uvx + round_div4(mv.col);
+  const int ruvy = uvy + round_div4(mv.row);
+  if (raw_u_mask == 0 && raw_v_mask == 0) {
+    copy_mb_uv_from_ref(dst, ref, mb_index, mv);
+    return;
+  }
+  copy_8x8_plane_from_ref_masked(dst + Y_SIZE, ref + Y_SIZE, UV_W, mb_x, mb_y,
+                                 ruvx, ruvy, raw_u_mask);
+  copy_8x8_plane_from_ref_masked(dst + Y_SIZE + UV_SIZE,
+                                 ref + Y_SIZE + UV_SIZE, UV_W, mb_x, mb_y,
+                                 ruvx, ruvy, raw_v_mask);
+}
+
+static void copy_mb_from_ref_masked(uint8_t *dst, const uint8_t *ref,
+                                    int mb_index, MV mv, uint16_t raw_y_mask,
+                                    uint8_t raw_u_mask, uint8_t raw_v_mask) {
+  if (raw_y_mask == 0 && raw_u_mask == 0 && raw_v_mask == 0) {
+    copy_mb_from_ref(dst, ref, mb_index, mv);
+    return;
+  }
+  copy_mb_y_from_ref_masked(dst, ref, mb_index, mv, raw_y_mask);
+  copy_mb_uv_from_ref_masked(dst, ref, mb_index, mv, raw_u_mask, raw_v_mask);
 }
 
 static uint8_t clip_u8_int(int v) {
@@ -2947,6 +3100,17 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
   return EXIT_SUCCESS;
 }
 
+static void mark_raw4_mask(O3vpxMbCommand *cmd, const ResBlock *block) {
+  if (!cmd || !block || block->type != REPAIR_CAND_RAW4) return;
+  if (block->plane == PATCH_PLANE_Y) {
+    cmd->raw_y_mask |= (uint16_t)(1u << block->block);
+  } else if (block->plane == PATCH_PLANE_U) {
+    cmd->raw_u_mask |= (uint8_t)(1u << block->block);
+  } else if (block->plane == PATCH_PLANE_V) {
+    cmd->raw_v_mask |= (uint8_t)(1u << block->block);
+  }
+}
+
 static void parse_p_frame_commands(O3vpxReader *reader,
                                    O3vpxMbCommand *commands,
                                    uint32_t payload_len,
@@ -2959,6 +3123,9 @@ static void parse_p_frame_commands(O3vpxReader *reader,
     uint8_t mode = get_u8(reader);
     cmd->mode = mode;
     cmd->block_count = 0;
+    cmd->raw_u_mask = 0;
+    cmd->raw_v_mask = 0;
+    cmd->raw_y_mask = 0;
     consumed += 1;
     if (info && mode < O3VPX_MODE_COUNT) {
       info->mode_counts[mode]++;
@@ -3027,6 +3194,7 @@ static void parse_p_frame_commands(O3vpxReader *reader,
         consumed += (uint32_t)read_res4(reader, block);
         count_res4_block(info, block);
         if (block->plane != PATCH_PLANE_Y) die("rawuv residual not luma");
+        mark_raw4_mask(cmd, block);
       }
     } else if (mode == MODE_INTRA_DC || mode == MODE_INTRA_V ||
                mode == MODE_INTRA_H) {
@@ -3052,6 +3220,7 @@ static void parse_p_frame_commands(O3vpxReader *reader,
           die("bad 4x4 patch block");
         }
         reader_exact(reader, block->raw, RAW_4X4_BYTES);
+        mark_raw4_mask(cmd, block);
         if (info) info->raw4_blocks++;
         consumed += 2 + RAW_4X4_BYTES;
       }
@@ -3070,6 +3239,7 @@ static void parse_p_frame_commands(O3vpxReader *reader,
         ResBlock *block = &cmd->data.blocks[block_index];
         consumed += (uint32_t)read_res4(reader, block);
         count_res4_block(info, block);
+        mark_raw4_mask(cmd, block);
       }
     } else {
       die("bad P-frame mode");
@@ -3098,7 +3268,7 @@ static void apply_mb_command(uint8_t *recon, const uint8_t *ref, int mb,
     copy_mb_y_from_ref(recon, ref, mb, cmd->mv);
     apply_raw_uv_mb_bytes_to_frame(recon, mb, cmd->data.raw);
   } else if (cmd->mode == MODE_COPY16_RES4_RAWUV) {
-    copy_mb_y_from_ref(recon, ref, mb, cmd->mv);
+    copy_mb_y_from_ref_masked(recon, ref, mb, cmd->mv, cmd->raw_y_mask);
     apply_raw_uv_mb_bytes_to_frame(recon, mb, cmd->data.rawuv.raw);
     for (block_index = 0; block_index < cmd->block_count; ++block_index) {
       apply_res4_to_frame(recon, mb, &cmd->data.rawuv.blocks[block_index],
@@ -3111,12 +3281,14 @@ static void apply_mb_command(uint8_t *recon, const uint8_t *ref, int mb,
   } else if (cmd->mode == MODE_INTRA_H) {
     predict_intra_mb(recon, mb, MODE_INTRA_H);
   } else if (cmd->mode == MODE_COPY16_PATCH4) {
-    copy_mb_from_ref(recon, ref, mb, cmd->mv);
+    copy_mb_from_ref_masked(recon, ref, mb, cmd->mv, cmd->raw_y_mask,
+                            cmd->raw_u_mask, cmd->raw_v_mask);
     for (block_index = 0; block_index < cmd->block_count; ++block_index) {
       apply_res4_to_frame(recon, mb, &cmd->data.blocks[block_index], res_q);
     }
   } else if (cmd->mode == MODE_COPY16_RES4) {
-    copy_mb_from_ref(recon, ref, mb, cmd->mv);
+    copy_mb_from_ref_masked(recon, ref, mb, cmd->mv, cmd->raw_y_mask,
+                            cmd->raw_u_mask, cmd->raw_v_mask);
     for (block_index = 0; block_index < cmd->block_count; ++block_index) {
       apply_res4_to_frame(recon, mb, &cmd->data.blocks[block_index], res_q);
     }
