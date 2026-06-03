@@ -176,6 +176,7 @@ typedef struct O3vpxReader {
 typedef struct O3vpxDecoderState {
   const uint8_t *stream;
   size_t stream_len;
+  FILE *stream_file;
   O3vpxReader reader;
   int frames;
   int res_q;
@@ -3031,13 +3032,46 @@ size_t vp8_o3vpx_decoder_internal_bytes(void) { return FRAME_SIZE * 2; }
 
 size_t vp8_o3vpx_eye_frame_bytes(void) { return O3VPX_EYE_FRAME_SIZE; }
 
+static void decoder_free_frame_buffers(O3vpxDecoderState *state) {
+  if (!state) return;
+  free(state->ref);
+  free(state->recon);
+  state->ref = NULL;
+  state->recon = NULL;
+}
+
+static int decoder_alloc_frame_buffers(O3vpxDecoderState *state) {
+  if (!state) return -1;
+  state->ref = (uint8_t *)malloc(FRAME_SIZE);
+  state->recon = (uint8_t *)malloc(FRAME_SIZE);
+  if (!state->ref || !state->recon) {
+    decoder_free_frame_buffers(state);
+    return -2;
+  }
+  return 0;
+}
+
+static int decoder_finish_init(O3vpxDecoderState *state) {
+  int rc = vp8_o3vpx_decoder_reset(state);
+  if (rc != 0) {
+    decoder_free_frame_buffers(state);
+    memset(state, 0, sizeof(*state));
+  }
+  return rc;
+}
+
 int vp8_o3vpx_decoder_reset(void *decoder) {
   O3vpxDecoderState *state = (O3vpxDecoderState *)decoder;
-  if (!state || !state->stream || state->stream_len == 0 || !state->ref ||
-      !state->recon) {
+  if (!state || !state->ref || !state->recon ||
+      (!state->stream_file && (!state->stream || state->stream_len == 0))) {
     return -1;
   }
-  reader_init_mem(&state->reader, state->stream, state->stream_len);
+  if (state->stream_file) {
+    if (fseek(state->stream_file, 0, SEEK_SET) != 0) return -3;
+    reader_init_file(&state->reader, state->stream_file);
+  } else {
+    reader_init_mem(&state->reader, state->stream, state->stream_len);
+  }
   if (!read_stream_header(&state->reader, &state->frames, &state->res_q)) {
     return -2;
   }
@@ -3056,15 +3090,26 @@ int vp8_o3vpx_decoder_init(void *decoder, size_t decoder_size,
   memset(state, 0, sizeof(*state));
   state->stream = stream;
   state->stream_len = stream_len;
-  state->ref = (uint8_t *)malloc(FRAME_SIZE);
-  state->recon = (uint8_t *)malloc(FRAME_SIZE);
-  if (!state->ref || !state->recon) {
-    free(state->ref);
-    free(state->recon);
+  if (decoder_alloc_frame_buffers(state) != 0) {
     memset(state, 0, sizeof(*state));
     return -2;
   }
-  return vp8_o3vpx_decoder_reset(state);
+  return decoder_finish_init(state);
+}
+
+int vp8_o3vpx_decoder_init_file(void *decoder, size_t decoder_size,
+                                FILE *stream) {
+  O3vpxDecoderState *state = (O3vpxDecoderState *)decoder;
+  if (!state || decoder_size < sizeof(*state) || !stream) {
+    return -1;
+  }
+  memset(state, 0, sizeof(*state));
+  state->stream_file = stream;
+  if (decoder_alloc_frame_buffers(state) != 0) {
+    memset(state, 0, sizeof(*state));
+    return -2;
+  }
+  return decoder_finish_init(state);
 }
 
 int vp8_o3vpx_decoder_next_frame(void *decoder, O3vpxFrameInfo *info) {
@@ -3135,8 +3180,7 @@ int vp8_o3vpx_decoder_write_current_yuv420p(void *decoder, unsigned char *left,
 void vp8_o3vpx_decoder_drop(void *decoder) {
   O3vpxDecoderState *state = (O3vpxDecoderState *)decoder;
   if (!state) return;
-  free(state->ref);
-  free(state->recon);
+  decoder_free_frame_buffers(state);
   memset(state, 0, sizeof(*state));
 }
 
