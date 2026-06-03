@@ -34,6 +34,7 @@ typedef struct O3vpxFrameInfo {
 size_t vp8_o3vpx_decoder_size(void);
 size_t vp8_o3vpx_decoder_align(void);
 size_t vp8_o3vpx_decoder_internal_bytes(void);
+size_t vp8_o3vpx_frame_bytes(void);
 size_t vp8_o3vpx_eye_frame_bytes(void);
 int vp8_o3vpx_decoder_init(void *decoder, size_t decoder_size,
                            const unsigned char *stream, size_t stream_len);
@@ -44,6 +45,9 @@ int vp8_o3vpx_decoder_next_frame(void *decoder, O3vpxFrameInfo *info);
 int vp8_o3vpx_decoder_write_current_eye_yuv420p(void *decoder, int eye,
                                                 unsigned char *out,
                                                 size_t out_len);
+int vp8_o3vpx_decoder_write_current_frame_yuv420p(void *decoder,
+                                                  unsigned char *out,
+                                                  size_t out_len);
 int vp8_o3vpx_decoder_write_current_yuv420p(void *decoder,
                                             unsigned char *left,
                                             size_t left_len,

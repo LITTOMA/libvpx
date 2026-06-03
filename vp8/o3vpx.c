@@ -3055,6 +3055,8 @@ size_t vp8_o3vpx_decoder_align(void) { return 16; }
 
 size_t vp8_o3vpx_decoder_internal_bytes(void) { return FRAME_SIZE * 2; }
 
+size_t vp8_o3vpx_frame_bytes(void) { return O3VPX_FRAME_SIZE; }
+
 size_t vp8_o3vpx_eye_frame_bytes(void) { return O3VPX_EYE_FRAME_SIZE; }
 
 static void decoder_free_frame_buffers(O3vpxDecoderState *state) {
@@ -3190,6 +3192,17 @@ int vp8_o3vpx_decoder_write_current_eye_yuv420p(void *decoder, int eye,
     memcpy(out_v + row * (O3VPX_EYE_WIDTH / 2), src_v + row * UV_W + uv_x,
            O3VPX_EYE_WIDTH / 2);
   }
+  return 0;
+}
+
+int vp8_o3vpx_decoder_write_current_frame_yuv420p(void *decoder,
+                                                  unsigned char *out,
+                                                  size_t out_len) {
+  O3vpxDecoderState *state = (O3vpxDecoderState *)decoder;
+  if (!state || !state->recon || !out || out_len < O3VPX_FRAME_SIZE) {
+    return -1;
+  }
+  memcpy(out, state->recon, O3VPX_FRAME_SIZE);
   return 0;
 }
 
