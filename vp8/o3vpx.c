@@ -352,9 +352,17 @@ static void reader_exact(O3vpxReader *reader, void *dst, size_t len) {
 }
 
 static uint8_t get_u8(O3vpxReader *reader) {
-  uint8_t v;
-  reader_exact(reader, &v, 1);
-  return v;
+  if (reader->file) {
+    if (reader->buffer_pos >= reader->buffer_len) {
+      reader->buffer_pos = 0;
+      reader->buffer_len =
+          fread(reader->buffer, 1, sizeof(reader->buffer), reader->file);
+      if (reader->buffer_len == 0) die("unexpected EOF");
+    }
+    return reader->buffer[reader->buffer_pos++];
+  }
+  if (reader->pos >= reader->len) die("unexpected EOF");
+  return reader->data[reader->pos++];
 }
 
 static uint16_t get_le16(O3vpxReader *reader) {
@@ -385,10 +393,6 @@ static size_t file_size(FILE *f) {
 }
 
 static int mb_eye_min_x(int mb_x) { return mb_x < MB_W / 2 ? 0 : MB_W / 2; }
-
-static int mb_eye_max_x(int mb_x) {
-  return mb_x < MB_W / 2 ? MB_W / 2 - 1 : MB_W - 1;
-}
 
 static int round_div4(int v) {
   return v >= 0 ? (v + 2) / 4 : -((-v + 2) / 4);
@@ -516,18 +520,10 @@ static int mv_in_bounds_same_eye(int mb_index, MV mv) {
   int mb_y = mb_index / MB_W;
   int x2 = mb_x * 32 + mv.col;
   int y2 = mb_y * 32 + mv.row;
-  int x;
-  int y;
-  int fx;
-  int fy;
-  int min_x = mb_eye_min_x(mb_x) * 16;
-  int max_x = (mb_eye_max_x(mb_x) + 1) * 16;
-  if (x2 < min_x * 2 || y2 < 0) return 0;
-  x = x2 >> 1;
-  y = y2 >> 1;
-  fx = x2 & 1;
-  fy = y2 & 1;
-  return x + 16 + fx <= max_x && y + 16 + fy <= HEIGHT;
+  int min_x2 = mb_x < MB_W / 2 ? 0 : WIDTH;
+  int max_x2 = mb_x < MB_W / 2 ? WIDTH - 32 : WIDTH * 2 - 32;
+  return x2 >= min_x2 && x2 <= max_x2 && y2 >= 0 &&
+         y2 <= HEIGHT * 2 - 32;
 }
 
 static MV find_best_mv(const uint8_t *src, const uint8_t *ref, int mb_index,
@@ -572,14 +568,10 @@ static MV find_best_mv(const uint8_t *src, const uint8_t *ref, int mb_index,
   return best;
 }
 
-static void copy_mb_from_ref(uint8_t *dst, const uint8_t *ref, int mb_index,
-                             MV mv) {
+static void copy_mb_y_from_ref(uint8_t *dst, const uint8_t *ref, int mb_index,
+                               MV mv) {
   const uint8_t *ref_y = ref;
-  const uint8_t *ref_u = ref + Y_SIZE;
-  const uint8_t *ref_v = ref + Y_SIZE + UV_SIZE;
   uint8_t *dst_y = dst;
-  uint8_t *dst_u = dst + Y_SIZE;
-  uint8_t *dst_v = dst + Y_SIZE + UV_SIZE;
   int mb_x = mb_index % MB_W;
   int mb_y = mb_index / MB_W;
   int row;
@@ -587,10 +579,6 @@ static void copy_mb_from_ref(uint8_t *dst, const uint8_t *ref, int mb_index,
   int y = mb_y * 16;
   int rx2 = x * 2 + mv.col;
   int ry2 = y * 2 + mv.row;
-  int uvx = mb_x * 8;
-  int uvy = mb_y * 8;
-  int ruvx = uvx + round_div4(mv.col);
-  int ruvy = uvy + round_div4(mv.row);
   const int rx = rx2 >> 1;
   const int ry = ry2 >> 1;
   const int fx = rx2 & 1;
@@ -632,12 +620,33 @@ static void copy_mb_from_ref(uint8_t *dst, const uint8_t *ref, int mb_index,
       }
     }
   }
+}
+
+static void copy_mb_uv_from_ref(uint8_t *dst, const uint8_t *ref, int mb_index,
+                                MV mv) {
+  const uint8_t *ref_u = ref + Y_SIZE;
+  const uint8_t *ref_v = ref + Y_SIZE + UV_SIZE;
+  uint8_t *dst_u = dst + Y_SIZE;
+  uint8_t *dst_v = dst + Y_SIZE + UV_SIZE;
+  int mb_x = mb_index % MB_W;
+  int mb_y = mb_index / MB_W;
+  int row;
+  int uvx = mb_x * 8;
+  int uvy = mb_y * 8;
+  int ruvx = uvx + round_div4(mv.col);
+  int ruvy = uvy + round_div4(mv.row);
   for (row = 0; row < 8; ++row) {
     memcpy(dst_u + (uvy + row) * UV_W + uvx,
            ref_u + (ruvy + row) * UV_W + ruvx, 8);
     memcpy(dst_v + (uvy + row) * UV_W + uvx,
            ref_v + (ruvy + row) * UV_W + ruvx, 8);
   }
+}
+
+static void copy_mb_from_ref(uint8_t *dst, const uint8_t *ref, int mb_index,
+                             MV mv) {
+  copy_mb_y_from_ref(dst, ref, mb_index, mv);
+  copy_mb_uv_from_ref(dst, ref, mb_index, mv);
 }
 
 static uint8_t clip_u8_int(int v) {
@@ -2959,7 +2968,7 @@ static int decode_next_frame_from_reader(O3vpxReader *reader, uint8_t *ref,
         mv.row = (int8_t)get_u8(reader);
         consumed += 2;
         if (!mv_in_bounds_same_eye(mb, mv)) die("raw-y MV out of bounds");
-        copy_mb_from_ref(recon, ref, mb, mv);
+        copy_mb_uv_from_ref(recon, ref, mb, mv);
         read_raw_y_mb(reader, recon, mb);
         consumed += RAW_Y_MB_BYTES;
       } else if (mode == MODE_RAW_UV_MB) {
@@ -2968,7 +2977,7 @@ static int decode_next_frame_from_reader(O3vpxReader *reader, uint8_t *ref,
         mv.row = (int8_t)get_u8(reader);
         consumed += 2;
         if (!mv_in_bounds_same_eye(mb, mv)) die("raw-uv MV out of bounds");
-        copy_mb_from_ref(recon, ref, mb, mv);
+        copy_mb_y_from_ref(recon, ref, mb, mv);
         read_raw_uv_mb(reader, recon, mb);
         consumed += RAW_UV_MB_BYTES;
       } else if (mode == MODE_COPY16_RES4_RAWUV) {
@@ -2983,7 +2992,7 @@ static int decode_next_frame_from_reader(O3vpxReader *reader, uint8_t *ref,
           die("rawuv-residual MV out of bounds");
         }
         if (block_count > 16) die("too many rawuv residual blocks");
-        copy_mb_from_ref(recon, ref, mb, mv);
+        copy_mb_y_from_ref(recon, ref, mb, mv);
         read_raw_uv_mb(reader, recon, mb);
         consumed += RAW_UV_MB_BYTES;
         for (block_index = 0; block_index < block_count; ++block_index) {
