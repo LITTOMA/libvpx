@@ -36,6 +36,7 @@
 #define UV_H (HEIGHT / 2)
 #define UV_SIZE (UV_W * UV_H)
 #define FRAME_SIZE O3VPX_FRAME_SIZE
+#define READER_BUFFER_SIZE (32 * 1024)
 #define RAW_MB_BYTES (16 * 16 + 8 * 8 + 8 * 8)
 #define RAW_Y_MB_BYTES (16 * 16)
 #define RAW_UV_MB_BYTES (8 * 8 + 8 * 8)
@@ -171,6 +172,9 @@ typedef struct O3vpxReader {
   const uint8_t *data;
   size_t len;
   size_t pos;
+  uint8_t buffer[READER_BUFFER_SIZE];
+  size_t buffer_pos;
+  size_t buffer_len;
 } O3vpxReader;
 
 typedef struct O3vpxDecoderState {
@@ -316,7 +320,28 @@ static void reader_init_mem(O3vpxReader *reader, const uint8_t *data,
 
 static void reader_exact(O3vpxReader *reader, void *dst, size_t len) {
   if (reader->file) {
-    if (fread(dst, 1, len, reader->file) != len) die("unexpected EOF");
+    uint8_t *out = (uint8_t *)dst;
+    while (len > 0) {
+      size_t available = reader->buffer_len - reader->buffer_pos;
+      size_t take;
+      if (available == 0) {
+        reader->buffer_pos = 0;
+        reader->buffer_len = 0;
+        if (len >= sizeof(reader->buffer)) {
+          if (fread(out, 1, len, reader->file) != len) die("unexpected EOF");
+          return;
+        }
+        reader->buffer_len =
+            fread(reader->buffer, 1, sizeof(reader->buffer), reader->file);
+        if (reader->buffer_len == 0) die("unexpected EOF");
+        available = reader->buffer_len;
+      }
+      take = len < available ? len : available;
+      memcpy(out, reader->buffer + reader->buffer_pos, take);
+      reader->buffer_pos += take;
+      out += take;
+      len -= take;
+    }
     return;
   }
   if (reader->pos > reader->len || len > reader->len - reader->pos) {
