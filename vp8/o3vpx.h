@@ -10,6 +10,7 @@
 #define VPX_VP8_O3VPX_H_
 
 #include <stddef.h>
+#include <stdio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -23,21 +24,37 @@ extern "C" {
 #define O3VPX_EYE_HEIGHT O3VPX_HEIGHT
 #define O3VPX_EYE_FRAME_SIZE \
   (O3VPX_EYE_WIDTH * O3VPX_EYE_HEIGHT * 3 / 2)
+#define O3VPX_MODE_COUNT 12
 
 typedef struct O3vpxFrameInfo {
   unsigned int frame_no;
   unsigned int frame_type;
   unsigned int frame_size_bytes;
+  unsigned int mode_counts[O3VPX_MODE_COUNT];
+  unsigned int residual_blocks;
+  unsigned int raw4_blocks;
+  unsigned int dc_only_blocks;
+  unsigned int full_idct_blocks;
+  unsigned int halfpel_mb;
 } O3vpxFrameInfo;
 
 size_t vp8_o3vpx_decoder_size(void);
 size_t vp8_o3vpx_decoder_align(void);
 size_t vp8_o3vpx_decoder_internal_bytes(void);
+size_t vp8_o3vpx_frame_bytes(void);
 size_t vp8_o3vpx_eye_frame_bytes(void);
 int vp8_o3vpx_decoder_init(void *decoder, size_t decoder_size,
                            const unsigned char *stream, size_t stream_len);
+int vp8_o3vpx_decoder_init_file(void *decoder, size_t decoder_size,
+                                FILE *stream);
 int vp8_o3vpx_decoder_reset(void *decoder);
 int vp8_o3vpx_decoder_next_frame(void *decoder, O3vpxFrameInfo *info);
+int vp8_o3vpx_decoder_write_current_eye_yuv420p(void *decoder, int eye,
+                                                unsigned char *out,
+                                                size_t out_len);
+int vp8_o3vpx_decoder_write_current_frame_yuv420p(void *decoder,
+                                                  unsigned char *out,
+                                                  size_t out_len);
 int vp8_o3vpx_decoder_write_current_yuv420p(void *decoder,
                                             unsigned char *left,
                                             size_t left_len,

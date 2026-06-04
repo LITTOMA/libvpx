@@ -20,7 +20,14 @@ static void usage(const char *prog) {
           "[previous_o3vpx_psnr.log]\n"
           "  %s dec <in.o3vx> <out-800x240-yuv420.yuv> [frames]\n"
           "  %s decmem <in.o3vx> <out-800x240-yuv420.yuv> [frames]\n"
-          "  %s decnull <in.o3vx> [frames]\n",
+          "  %s decnull <in.o3vx> [frames]\n"
+          "encoder env:\n"
+          "  O3VPX_DECODE_COST_BUDGET\n"
+          "  O3VPX_MAX_P_FRAME_BYTES\n"
+          "  O3VPX_MAX_FULL_IDCT_BLOCKS\n"
+          "  O3VPX_MAX_HALFPEL_MB\n"
+          "  O3VPX_MAX_RESIDUAL_BLOCKS\n"
+          "  O3VPX_MAX_RAW4_BLOCKS\n",
           prog, prog, prog, prog);
 }
 
