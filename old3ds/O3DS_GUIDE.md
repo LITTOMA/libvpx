@@ -138,6 +138,11 @@ min_gain_per_byte    repair admission threshold; current value is 3
 p_burst_mult         temporary P-frame burst allowance; current value is 2.5
 ```
 
+For realtime-oriented candidates, the encoder also honors
+`O3VPX_DECODE_COST_BUDGET`. A value such as `3500000` caps the estimated
+per-P-frame reconstruction cost and biases the encoder away from frames packed
+with full-IDCT residual blocks.
+
 The encoder writes per-frame mode and byte summaries to stderr, so keep
 `encode.log`.
 

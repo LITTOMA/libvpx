@@ -99,6 +99,13 @@
 #define QUALITY_GAIN_SCALE_MAX 2.00
 #define QUALITY_PLANE_GAIN_MIN 0.80
 #define QUALITY_PLANE_GAIN_MAX 1.75
+#define DECODE_COST_RAW4 64u
+#define DECODE_COST_RES4_DC 128u
+#define DECODE_COST_RES4_FAST 320u
+#define DECODE_COST_RES4_FULL_IDCT 768u
+#define DECODE_COST_COPY_INTEGER_MB 96u
+#define DECODE_COST_COPY_HALFPEL_MB 512u
+#define DECODE_COST_COPY16_DC 96u
 #define IDCT_COSPI8SQRT2MINUS1 20091
 #define IDCT_SINPI8SQRT2 35468
 
@@ -130,6 +137,7 @@ typedef struct ResBlock {
   uint8_t packed_coeffs;
   uint16_t cost;
   uint16_t coeff_mask;
+  uint32_t decode_cost;
   uint64_t gain;
   int8_t qcoeff[16];
   uint8_t raw[RAW_4X4_BYTES];
@@ -139,6 +147,7 @@ typedef struct MbResState {
   uint32_t block_mask;
   uint8_t count;
   size_t cost;
+  uint32_t decode_cost;
   uint64_t gain;
   ResBlock blocks[RES_BLOCKS_PER_MB];
 } MbResState;
@@ -150,6 +159,7 @@ typedef struct ResCandidate {
   uint64_t pred_sse;
   uint64_t recon_sse;
   uint16_t cost;
+  uint32_t decode_cost;
   uint8_t type;
   int8_t dc_y;
   int8_t dc_u;
@@ -1010,6 +1020,7 @@ static int eval_copy16_dc_candidate(const uint8_t *src, const uint8_t *ref,
   candidate->pred_sse = pred_sse_y + pred_sse_u + pred_sse_v;
   candidate->recon_sse = recon_sse_y + recon_sse_u + recon_sse_v;
   candidate->cost = COPY16_DC_EXTRA_COST;
+  candidate->decode_cost = DECODE_COST_COPY16_DC;
   candidate->type = REPAIR_CAND_COPY16_DC;
   candidate->dc_y = off_y;
   candidate->dc_u = off_u;
@@ -1126,6 +1137,7 @@ static int __attribute__((unused)) eval_copy16_qdc_candidate(
   candidate->pred_sse = pred_sse_y + pred_sse_u + pred_sse_v;
   candidate->recon_sse = recon_sse_y + recon_sse_u + recon_sse_v;
   candidate->cost = COPY16_QDC_EXTRA_COST;
+  candidate->decode_cost = DECODE_COST_COPY16_DC;
   candidate->type = REPAIR_CAND_COPY16_QDC;
   for (q = 0; q < 4; ++q) candidate->dc_y4[q] = off_y[q];
   candidate->dc_u = off_u;
@@ -1577,6 +1589,29 @@ static uint64_t repair_score_gain(uint8_t plane, uint64_t gain,
   return scaled_gain(gain, scale);
 }
 
+static int res4_uses_fast_idct(uint16_t coeff_mask) {
+  return coeff_mask == 1 ||
+         (coeff_mask & (uint16_t)~0x020d) == 0 ||
+         (coeff_mask & (uint16_t)~0x0063) == 0 ||
+         (coeff_mask & (uint16_t)~0x0017) == 0;
+}
+
+static int res4_uses_full_idct(uint16_t coeff_mask) {
+  return coeff_mask != 1 && !res4_uses_fast_idct(coeff_mask);
+}
+
+static uint32_t res4_decode_cost(uint8_t type, uint16_t coeff_mask) {
+  if (type == REPAIR_CAND_RAW4) return DECODE_COST_RAW4;
+  if (coeff_mask == 1) return DECODE_COST_RES4_DC;
+  return res4_uses_full_idct(coeff_mask) ? DECODE_COST_RES4_FULL_IDCT
+                                         : DECODE_COST_RES4_FAST;
+}
+
+static uint32_t mv_decode_cost(MV mv) {
+  return ((mv.col & 1) || (mv.row & 1)) ? DECODE_COST_COPY_HALFPEL_MB
+                                        : DECODE_COST_COPY_INTEGER_MB;
+}
+
 static int coeff_q_step(int res_q, int coeff) {
   int q = coeff == 0 ? (res_q + 1) / 2 : res_q;
   return q < 1 ? 1 : q;
@@ -1707,6 +1742,8 @@ static int eval_res4_candidate(const uint8_t *src, const uint8_t *ref,
   candidate->recon_sse = recon_sse;
   candidate->cost = res4_encoded_cost(mask, (uint8_t)packed_coeffs, nz);
   candidate->block.cost = candidate->cost;
+  candidate->decode_cost = res4_decode_cost(REPAIR_CAND_RES4, mask);
+  candidate->block.decode_cost = candidate->decode_cost;
   candidate->block.gain = candidate->gain;
   candidate->type = REPAIR_CAND_RES4;
   return 1;
@@ -1730,6 +1767,8 @@ static int eval_raw4_candidate(const uint8_t *src, const uint8_t *ref,
   candidate->recon_sse = 0;
   candidate->cost = 1 + RAW_4X4_BYTES;
   candidate->block.cost = candidate->cost;
+  candidate->decode_cost = res4_decode_cost(REPAIR_CAND_RAW4, 0);
+  candidate->block.decode_cost = candidate->decode_cost;
   candidate->block.gain = candidate->gain;
   candidate->type = REPAIR_CAND_RAW4;
   return 1;
@@ -2117,9 +2156,7 @@ static void count_res4_block(O3vpxFrameInfo *info, const ResBlock *block) {
   info->residual_blocks++;
   if (block->coeff_mask == 1) {
     info->dc_only_blocks++;
-  } else if ((block->coeff_mask & (uint16_t)~0x020d) != 0 &&
-             (block->coeff_mask & (uint16_t)~0x0063) != 0 &&
-             (block->coeff_mask & (uint16_t)~0x0017) != 0) {
+  } else if (res4_uses_full_idct(block->coeff_mask)) {
     info->full_idct_blocks++;
   }
 }
@@ -2422,6 +2459,19 @@ static size_t sum_future_plan(const size_t *planned_p_budget, int frames,
   return sum;
 }
 
+static unsigned int env_u32_or_default(const char *name, unsigned int value) {
+  const char *text = getenv(name);
+  char *end = NULL;
+  unsigned long parsed;
+  if (!text || !text[0]) return value;
+  errno = 0;
+  parsed = strtoul(text, &end, 10);
+  if (errno != 0 || end == text || *end != '\0' || parsed > UINT32_MAX) {
+    die("bad unsigned integer environment value");
+  }
+  return (unsigned int)parsed;
+}
+
 static void write_file_header(FILE *out, int frames, double target_mbps,
                               int keyint, int radius, int res_q) {
   if (fwrite(O3VPX_MAGIC, 1, 4, out) != 4) die_errno("write failed");
@@ -2500,6 +2550,8 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
   double *quality_budget_bias;
   double *quality_gain_scale;
   double *quality_plane_gain_scale;
+  unsigned int decode_cost_budget =
+      env_u32_or_default("O3VPX_DECODE_COST_BUDGET", 0);
   int quality_bias_active;
 
   in = fopen(in_path, "rb");
@@ -2589,10 +2641,12 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
             "key_plan_summary frames=%d keys=%d p_frames=%d target_mbps=%.6f "
             "p_payload_budget=%zu total_p_payload_budget=%zu "
             "scene_mse_threshold=%.2f res_q=%d min_gain_per_byte=%.3f "
-            "p_burst_mult=%.3f quality_bias_active=%d\n",
+            "p_burst_mult=%.3f decode_cost_budget=%u "
+            "quality_bias_active=%d\n",
             frames, key_count, p_count, target_mbps, p_budget,
             total_p_payload_budget, scene_mse_threshold, res_q,
-            min_gain_per_byte, p_burst_mult, quality_bias_active);
+            min_gain_per_byte, p_burst_mult, decode_cost_budget,
+            quality_bias_active);
   }
 
   out = fopen(out_path, "wb");
@@ -2644,7 +2698,11 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
       int res_mb = 0;
       int res4 = 0;
       int raw4 = 0;
+      int res_dc = 0;
+      int res_fast = 0;
+      int res_full_idct = 0;
       int res_coeff = 0;
+      uint32_t estimated_decode_cost = 0;
       double avg_remaining_payload;
       double frame_min_gain_per_byte;
       const double *frame_plane_gain_scale =
@@ -2682,6 +2740,7 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
         uint64_t raw_uv_gain;
         analysis[i].index = i;
         analysis[i].mv = find_best_mv(src, ref, i, radius, &analysis[i].sad);
+        estimated_decode_cost += mv_decode_cost(analysis[i].mv);
         analysis[i].raw_mode = 0;
         analysis[i].dc_y = 0;
         analysis[i].dc_u = 0;
@@ -2755,7 +2814,9 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
             candidate->type == REPAIR_CAND_COPY16_DC) {
           int raw_mode = MODE_RAW_MB;
           size_t replaced_cost = 0;
+          uint32_t replaced_decode_cost = 0;
           uint64_t replaced_gain = 0;
+          const uint32_t candidate_decode_cost = candidate->decode_cost;
           if (candidate->type == REPAIR_CAND_RAW_Y_MB) {
             raw_mode = MODE_RAW_Y_MB;
           } else if (candidate->type == REPAIR_CAND_RAW_UV_MB) {
@@ -2766,6 +2827,7 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
           if (analysis[candidate->mb_index].raw_mode) continue;
           if (state->count != 0) {
             replaced_cost = state->cost;
+            replaced_decode_cost = state->decode_cost;
             replaced_gain = state->gain;
             if (candidate->cost > replaced_cost) continue;
             if (candidate->gain <= replaced_gain) continue;
@@ -2777,15 +2839,24 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
               p_frame_budget) {
             continue;
           }
+          if (decode_cost_budget > 0 &&
+              estimated_decode_cost - replaced_decode_cost +
+                      candidate_decode_cost >
+                  decode_cost_budget) {
+            continue;
+          }
           analysis[candidate->mb_index].raw_mode = raw_mode;
           analysis[candidate->mb_index].dc_y = candidate->dc_y;
           analysis[candidate->mb_index].dc_u = candidate->dc_u;
           analysis[candidate->mb_index].dc_v = candidate->dc_v;
           estimated_payload = estimated_payload - replaced_cost + candidate->cost;
+          estimated_decode_cost = estimated_decode_cost - replaced_decode_cost +
+                                  candidate_decode_cost;
           if (state->count != 0) {
             state->block_mask = 0;
             state->count = 0;
             state->cost = 0;
+            state->decode_cost = 0;
             state->gain = 0;
           }
         } else {
@@ -2793,17 +2864,25 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
               res_block_slot(candidate->block.plane, candidate->block.block);
           const size_t extra_cost =
               (state->count == 0 ? 1u : 0u) + candidate->cost;
+          const uint32_t extra_decode_cost = candidate->decode_cost;
           if (analysis[candidate->mb_index].raw_mode) continue;
           if (state->block_mask & (1u << slot)) continue;
           if (estimated_payload + extra_cost > p_frame_budget) continue;
+          if (decode_cost_budget > 0 &&
+              estimated_decode_cost + extra_decode_cost >
+                  decode_cost_budget) {
+            continue;
+          }
           if (state->count >= RES_BLOCKS_PER_MB) {
             die("too many residual blocks");
           }
           state->block_mask |= (uint32_t)(1u << slot);
           state->blocks[state->count++] = candidate->block;
           state->cost += extra_cost;
+          state->decode_cost += extra_decode_cost;
           state->gain += candidate->gain;
           estimated_payload += extra_cost;
+          estimated_decode_cost += extra_decode_cost;
         }
       }
       qsort(dc_candidates, MB_COUNT, sizeof(dc_candidates[0]),
@@ -2829,9 +2908,22 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
         }
         if (state->count != 0) {
           replaced_cost = state->cost;
+          {
+            const uint32_t replaced_decode_cost = state->decode_cost;
+            if (decode_cost_budget > 0 &&
+                estimated_decode_cost - replaced_decode_cost +
+                        candidate->decode_cost >
+                    decode_cost_budget) {
+              continue;
+            }
+          }
           replaced_gain = state->gain;
           if (candidate->cost > replaced_cost) continue;
           if (candidate->gain <= replaced_gain) continue;
+        } else if (decode_cost_budget > 0 &&
+                   estimated_decode_cost + candidate->decode_cost >
+                       decode_cost_budget) {
+          continue;
         }
         if (estimated_payload - replaced_cost + candidate->cost >
             p_frame_budget) {
@@ -2845,11 +2937,14 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
         analysis[candidate->mb_index].dc_v = candidate->dc_v;
         memcpy(analysis[candidate->mb_index].dc_y4, candidate->dc_y4,
                sizeof(candidate->dc_y4));
+        estimated_decode_cost =
+            estimated_decode_cost - state->decode_cost + candidate->decode_cost;
         estimated_payload = estimated_payload - replaced_cost + candidate->cost;
         if (state->count != 0) {
           state->block_mask = 0;
           state->count = 0;
           state->cost = 0;
+          state->decode_cost = 0;
           state->gain = 0;
         }
       }
@@ -2859,11 +2954,14 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
         ResCandidate *candidate = &uv_candidates[i];
         MbResState *state = &res_state[candidate->mb_index];
         size_t replaced_cost = 0;
+        uint32_t replaced_decode_cost = 0;
         uint64_t replaced_gain = 0;
         int has_luma_residual = 0;
         size_t luma_cost = 0;
         uint64_t luma_gain = 0;
+        uint32_t luma_decode_cost = 0;
         size_t combo_cost = 0;
+        uint32_t combo_decode_cost = 0;
         uint64_t combo_gain = 0;
         int block_index;
         if (analysis[candidate->mb_index].raw_mode) continue;
@@ -2871,6 +2969,7 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
           if (state->blocks[block_index].plane == PATCH_PLANE_Y) {
             has_luma_residual = 1;
             luma_cost += state->blocks[block_index].cost;
+            luma_decode_cost += state->blocks[block_index].decode_cost;
             luma_gain += state->blocks[block_index].gain;
           }
         }
@@ -2889,20 +2988,32 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
               p_frame_budget) {
             continue;
           }
+          if (decode_cost_budget > 0 &&
+              estimated_decode_cost - state->decode_cost +
+                      candidate->decode_cost >
+                  decode_cost_budget) {
+            continue;
+          }
           analysis[candidate->mb_index].raw_mode = MODE_RAW_UV_MB;
           estimated_payload =
               estimated_payload - replaced_cost + candidate->cost;
+          estimated_decode_cost =
+              estimated_decode_cost - state->decode_cost +
+              candidate->decode_cost;
           if (state->count != 0) {
             state->block_mask = 0;
             state->count = 0;
             state->cost = 0;
+            state->decode_cost = 0;
             state->gain = 0;
           }
           continue;
         }
 
         replaced_cost = state->cost;
+        replaced_decode_cost = state->decode_cost;
         combo_cost = 1 + RAW_UV_MB_BYTES + luma_cost;
+        combo_decode_cost = candidate->decode_cost + luma_decode_cost;
         combo_gain = candidate->gain + luma_gain;
         if (combo_gain <= state->gain) continue;
         if (combo_cost > state->cost && frame_min_gain_per_byte > 0.0 &&
@@ -2911,6 +3022,11 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
           continue;
         }
         if (estimated_payload - state->cost + combo_cost > p_frame_budget) {
+          continue;
+        }
+        if (decode_cost_budget > 0 &&
+            estimated_decode_cost - state->decode_cost + combo_decode_cost >
+                decode_cost_budget) {
           continue;
         }
         {
@@ -2928,10 +3044,13 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
           state->block_mask = luma_mask;
           state->count = out_count;
           state->cost = combo_cost;
+          state->decode_cost = combo_decode_cost;
           state->gain = combo_gain;
         }
         analysis[candidate->mb_index].raw_mode = MODE_COPY16_RES4_RAWUV;
         estimated_payload = estimated_payload - replaced_cost + combo_cost;
+        estimated_decode_cost =
+            estimated_decode_cost - replaced_decode_cost + combo_decode_cost;
       }
       qsort(analysis, MB_COUNT, sizeof(analysis[0]), cmp_mb_index_asc);
       for (i = 0; i < MB_COUNT; ++i) {
@@ -2972,7 +3091,15 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
             write_repair4(&payload, src, i, block);
             apply_res4_to_frame(recon, i, block, res_q);
             ++res4;
-            if (block->type == REPAIR_CAND_RAW4) ++raw4;
+            if (block->type == REPAIR_CAND_RAW4) {
+              ++raw4;
+            } else if (block->coeff_mask == 1) {
+              ++res_dc;
+            } else if (res4_uses_full_idct(block->coeff_mask)) {
+              ++res_full_idct;
+            } else {
+              ++res_fast;
+            }
             res_coeff += block->nz;
           }
           ++rawuv_res_mb;
@@ -3000,7 +3127,15 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
             write_repair4(&payload, src, i, block);
             apply_res4_to_frame(recon, i, block, res_q);
             ++res4;
-            if (block->type == REPAIR_CAND_RAW4) ++raw4;
+            if (block->type == REPAIR_CAND_RAW4) {
+              ++raw4;
+            } else if (block->coeff_mask == 1) {
+              ++res_dc;
+            } else if (res4_uses_full_idct(block->coeff_mask)) {
+              ++res_full_idct;
+            } else {
+              ++res_fast;
+            }
             res_coeff += block->nz;
           }
           ++res_mb;
@@ -3047,9 +3182,11 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
       fprintf(stderr,
               "frame %d: type=p bytes=%zu raw_mb=%d raw_y_mb=%d "
               "raw_uv_mb=%d rawuv_res_mb=%d intra_dc=%d intra_v=%d "
-              "intra_h=%d res_mb=%d res4=%d raw4=%d res_coeff=%d "
+              "intra_h=%d res_mb=%d res4=%d raw4=%d res_dc=%d "
+              "res_fast=%d res_full_idct=%d res_coeff=%d "
               "copy16=%d copy16_dc=%d "
               "p_budget=%zu plan_budget=%zu frame_budget=%zu "
+              "decode_cost=%u decode_cost_budget=%u "
               "avg_remaining_payload=%.1f frame_min_gain_per_byte=%.3f "
               "remaining_p_payload=%zu remaining_p_frames=%d "
               "quality_budget_bias=%.3f "
@@ -3057,8 +3194,9 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
               "res_candidates=%d\n",
               frame_no, payload.len + 6, raw_mb, raw_y_mb, raw_uv_mb,
               rawuv_res_mb, intra_dc, intra_v, intra_h, res_mb, res4, raw4,
-              res_coeff, copy16, copy16_dc, p_budget, frame_plan_budget,
-              p_frame_budget,
+              res_dc, res_fast, res_full_idct, res_coeff, copy16, copy16_dc,
+              p_budget, frame_plan_budget, p_frame_budget,
+              estimated_decode_cost, decode_cost_budget,
               avg_remaining_payload, frame_min_gain_per_byte,
               remaining_p_payload_budget, remaining_p_frames,
               quality_budget_bias[frame_no], quality_gain_scale[frame_no],
