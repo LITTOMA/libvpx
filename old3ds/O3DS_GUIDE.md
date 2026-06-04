@@ -143,6 +143,29 @@ For realtime-oriented candidates, the encoder also honors
 per-P-frame reconstruction cost and biases the encoder away from frames packed
 with full-IDCT residual blocks.
 
+Additional realtime caps are available through environment variables:
+
+```text
+O3VPX_MAX_P_FRAME_BYTES       hard P-frame size cap including frame header
+O3VPX_MAX_FULL_IDCT_BLOCKS    hard full-IDCT residual block cap per P frame
+O3VPX_MAX_HALFPEL_MB          hard half-pel motion-vector macroblock cap
+O3VPX_MAX_RESIDUAL_BLOCKS     hard residual block cap per P frame
+```
+
+A conservative Old3DS realtime starting point is:
+
+```sh
+O3VPX_DECODE_COST_BUDGET=2800000 \
+O3VPX_MAX_P_FRAME_BYTES=40000 \
+O3VPX_MAX_FULL_IDCT_BLOCKS=1400 \
+O3VPX_MAX_HALFPEL_MB=560 \
+O3VPX_MAX_RESIDUAL_BLOCKS=6500 \
+tmp/libvpx-o3vpx-build/tools/o3vpx enc \
+  tmp/o3vpx_2d/source_201.yuv \
+  tmp/o3vpx_2d/realtime_8m.o3vx \
+  201 48 8 8 2000 20 5 1.1
+```
+
 The encoder writes per-frame mode and byte summaries to stderr, so keep
 `encode.log`.
 
