@@ -152,6 +152,7 @@ typedef struct MbResState {
   uint32_t decode_cost;
   unsigned int residual_blocks;
   unsigned int full_idct_blocks;
+  unsigned int raw4_blocks;
   uint64_t gain;
   ResBlock blocks[RES_BLOCKS_PER_MB];
 } MbResState;
@@ -1615,6 +1616,10 @@ static unsigned int res_block_full_idct_count(const ResBlock *block) {
   return res4_uses_full_idct(block->coeff_mask) ? 1u : 0u;
 }
 
+static unsigned int res_block_raw4_count(const ResBlock *block) {
+  return block != NULL && block->type == REPAIR_CAND_RAW4 ? 1u : 0u;
+}
+
 static uint32_t res4_decode_cost(uint8_t type, uint16_t coeff_mask) {
   if (type == REPAIR_CAND_RAW4) return DECODE_COST_RAW4;
   if (coeff_mask == 1) return DECODE_COST_RES4_DC;
@@ -2583,6 +2588,8 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
       env_u32_or_default("O3VPX_MAX_HALFPEL_MB", 0);
   unsigned int max_residual_blocks =
       env_u32_or_default("O3VPX_MAX_RESIDUAL_BLOCKS", 0);
+  unsigned int max_raw4_blocks =
+      env_u32_or_default("O3VPX_MAX_RAW4_BLOCKS", 0);
   int quality_bias_active;
 
   in = fopen(in_path, "rb");
@@ -2678,13 +2685,13 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
             "scene_mse_threshold=%.2f res_q=%d min_gain_per_byte=%.3f "
             "p_burst_mult=%.3f decode_cost_budget=%u "
             "max_p_frame_bytes=%u max_full_idct=%u max_halfpel=%u "
-            "max_residual=%u "
+            "max_residual=%u max_raw4=%u "
             "quality_bias_active=%d\n",
             frames, key_count, p_count, target_mbps, p_budget,
             total_p_payload_budget, scene_mse_threshold, res_q,
             min_gain_per_byte, p_burst_mult, decode_cost_budget,
             max_p_frame_bytes, max_full_idct_blocks, max_halfpel_mb,
-            max_residual_blocks,
+            max_residual_blocks, max_raw4_blocks,
             quality_bias_active);
   }
 
@@ -2745,6 +2752,7 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
       uint32_t estimated_decode_cost = 0;
       unsigned int estimated_residual_blocks = 0;
       unsigned int estimated_full_idct_blocks = 0;
+      unsigned int estimated_raw4_blocks = 0;
       unsigned int estimated_halfpel_mb = 0;
       double avg_remaining_payload;
       double frame_min_gain_per_byte;
@@ -2912,12 +2920,14 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
           if (state->count != 0) {
             estimated_residual_blocks -= state->residual_blocks;
             estimated_full_idct_blocks -= state->full_idct_blocks;
+            estimated_raw4_blocks -= state->raw4_blocks;
             state->block_mask = 0;
             state->count = 0;
             state->cost = 0;
             state->decode_cost = 0;
             state->residual_blocks = 0;
             state->full_idct_blocks = 0;
+            state->raw4_blocks = 0;
             state->gain = 0;
           }
         } else {
@@ -2930,6 +2940,8 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
               res_block_residual_count(&candidate->block);
           const unsigned int extra_full_idct_blocks =
               res_block_full_idct_count(&candidate->block);
+          const unsigned int extra_raw4_blocks =
+              res_block_raw4_count(&candidate->block);
           if (analysis[candidate->mb_index].raw_mode) continue;
           if (state->block_mask & (1u << slot)) continue;
           if (estimated_payload + extra_cost > p_frame_budget) continue;
@@ -2948,6 +2960,11 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
                   max_full_idct_blocks) {
             continue;
           }
+          if (max_raw4_blocks > 0 &&
+              estimated_raw4_blocks + extra_raw4_blocks >
+                  max_raw4_blocks) {
+            continue;
+          }
           if (state->count >= RES_BLOCKS_PER_MB) {
             die("too many residual blocks");
           }
@@ -2957,11 +2974,13 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
           state->decode_cost += extra_decode_cost;
           state->residual_blocks += extra_residual_blocks;
           state->full_idct_blocks += extra_full_idct_blocks;
+          state->raw4_blocks += extra_raw4_blocks;
           state->gain += candidate->gain;
           estimated_payload += extra_cost;
           estimated_decode_cost += extra_decode_cost;
           estimated_residual_blocks += extra_residual_blocks;
           estimated_full_idct_blocks += extra_full_idct_blocks;
+          estimated_raw4_blocks += extra_raw4_blocks;
         }
       }
       qsort(dc_candidates, MB_COUNT, sizeof(dc_candidates[0]),
@@ -3022,12 +3041,14 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
         if (state->count != 0) {
           estimated_residual_blocks -= state->residual_blocks;
           estimated_full_idct_blocks -= state->full_idct_blocks;
+          estimated_raw4_blocks -= state->raw4_blocks;
           state->block_mask = 0;
           state->count = 0;
           state->cost = 0;
           state->decode_cost = 0;
           state->residual_blocks = 0;
           state->full_idct_blocks = 0;
+          state->raw4_blocks = 0;
           state->gain = 0;
         }
       }
@@ -3045,6 +3066,7 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
         uint32_t luma_decode_cost = 0;
         unsigned int luma_residual_blocks = 0;
         unsigned int luma_full_idct_blocks = 0;
+        unsigned int luma_raw4_blocks = 0;
         size_t combo_cost = 0;
         uint32_t combo_decode_cost = 0;
         uint64_t combo_gain = 0;
@@ -3060,6 +3082,8 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
                 res_block_residual_count(&state->blocks[block_index]);
             luma_full_idct_blocks +=
                 res_block_full_idct_count(&state->blocks[block_index]);
+            luma_raw4_blocks +=
+                res_block_raw4_count(&state->blocks[block_index]);
           }
         }
         if (!has_luma_residual) {
@@ -3092,12 +3116,14 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
           if (state->count != 0) {
             estimated_residual_blocks -= state->residual_blocks;
             estimated_full_idct_blocks -= state->full_idct_blocks;
+            estimated_raw4_blocks -= state->raw4_blocks;
             state->block_mask = 0;
             state->count = 0;
             state->cost = 0;
             state->decode_cost = 0;
             state->residual_blocks = 0;
             state->full_idct_blocks = 0;
+            state->raw4_blocks = 0;
             state->gain = 0;
           }
           continue;
@@ -3134,6 +3160,12 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
                 max_full_idct_blocks) {
           continue;
         }
+        if (max_raw4_blocks > 0 &&
+            estimated_raw4_blocks - state->raw4_blocks +
+                    luma_raw4_blocks >
+                max_raw4_blocks) {
+          continue;
+        }
         {
           ResBlock luma_blocks[16];
           uint32_t luma_mask = 0;
@@ -3156,8 +3188,12 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
           estimated_full_idct_blocks = estimated_full_idct_blocks -
                                        state->full_idct_blocks +
                                        luma_full_idct_blocks;
+          estimated_raw4_blocks = estimated_raw4_blocks -
+                                  state->raw4_blocks +
+                                  luma_raw4_blocks;
           state->residual_blocks = luma_residual_blocks;
           state->full_idct_blocks = luma_full_idct_blocks;
+          state->raw4_blocks = luma_raw4_blocks;
           state->gain = combo_gain;
         }
         analysis[candidate->mb_index].raw_mode = MODE_COPY16_RES4_RAWUV;
@@ -3308,6 +3344,7 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
               "decode_cost=%u decode_cost_budget=%u "
               "halfpel_mb=%u halfpel_mv=%u max_halfpel=%u residual_est=%u "
               "max_residual=%u full_idct_est=%u max_full_idct=%u "
+              "raw4_est=%u max_raw4=%u "
               "max_p_frame_bytes=%u "
               "avg_remaining_payload=%.1f frame_min_gain_per_byte=%.3f "
               "remaining_p_payload=%zu remaining_p_frames=%d "
@@ -3323,7 +3360,8 @@ int vp8_o3vpx_encode_file(const char *in_path, const char *out_path, int frames,
               halfpel_mb, estimated_halfpel_mb, max_halfpel_mb,
               estimated_residual_blocks, max_residual_blocks,
               estimated_full_idct_blocks,
-              max_full_idct_blocks, max_p_frame_bytes,
+              max_full_idct_blocks, estimated_raw4_blocks, max_raw4_blocks,
+              max_p_frame_bytes,
               avg_remaining_payload, frame_min_gain_per_byte,
               remaining_p_payload_budget, remaining_p_frames,
               quality_budget_bias[frame_no], quality_gain_scale[frame_no],
