@@ -166,6 +166,21 @@ tmp/libvpx-o3vpx-build/tools/o3vpx enc \
   201 48 8 8 2000 20 5 1.1
 ```
 
+A more aggressive profile trades more texture detail for lower P-frame decode
+cost:
+
+```sh
+O3VPX_DECODE_COST_BUDGET=2400000 \
+O3VPX_MAX_P_FRAME_BYTES=34000 \
+O3VPX_MAX_FULL_IDCT_BLOCKS=1000 \
+O3VPX_MAX_HALFPEL_MB=480 \
+O3VPX_MAX_RESIDUAL_BLOCKS=5200 \
+tmp/libvpx-o3vpx-build/tools/o3vpx enc \
+  tmp/o3vpx_2d/source_201.yuv \
+  tmp/o3vpx_2d/realtime_aggressive_8m.o3vx \
+  201 48 8 8 2000 24 5 1.0
+```
+
 The encoder writes per-frame mode and byte summaries to stderr, so keep
 `encode.log`.
 
